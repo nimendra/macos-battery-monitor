@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import Security
 
 struct ProcessInfo: Identifiable {
     let id = UUID()
@@ -47,32 +48,80 @@ class ProcessMonitor: ObservableObject {
     }
     
     func killProcess(pid: String, name: String) {
-        let script = "do shell script \"kill -9 \(pid)\" with administrator privileges"
-        runAppleScript(script)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-            self.refresh()
-        }
-    }
-    
-    func logoutOtherUsers() {
-        // Need to escape quotes and backslashes properly for AppleScript
-        let shellScript = "CURRENT_USER=$(stat -f '%Su' /dev/console); for u in $(users | tr ' ' '\\n' | sort -u); do if [ \"$u\" != \"$CURRENT_USER\" ] && [ \"$u\" != \"root\" ] && [ \"$u\" != \"daemon\" ]; then pkill -u \"$u\"; fi; done"
-        // In AppleScript, we wrap the shell command in double quotes, so we must escape double quotes inside the shell command with \". We also must escape \n as \\n.
-        // Swift string literal handling:
-        let escapedShellScript = shellScript.replacingOccurrences(of: "\\", with: "\\\\").replacingOccurrences(of: "\"", with: "\\\"")
-        let scriptStr = "do shell script \"\(escapedShellScript)\" with administrator privileges"
-        
-        runAppleScript(scriptStr)
-    }
-    
-    private func runAppleScript(_ source: String) {
-        var error: NSDictionary? = nil
-        if let scriptObject = NSAppleScript(source: source) {
-            scriptObject.executeAndReturnError(&error)
-            if let err = error {
-                print("AppleScript Error: \(err)")
+        executePrivileged(tool: "/bin/kill", arguments: ["-9", pid]) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+                self.refresh()
             }
         }
+    }
+
+    func logoutOtherUsers() {
+        let script = "CURRENT_USER=$(stat -f '%Su' /dev/console); for u in $(users | tr ' ' '\\n' | sort -u); do if [ \"$u\" != \"$CURRENT_USER\" ] && [ \"$u\" != \"root\" ] && [ \"$u\" != \"daemon\" ]; then pkill -u \"$u\"; fi; done"
+        executePrivileged(tool: "/bin/bash", arguments: ["-c", script])
+    }
+
+    private var cachedAuth: AuthorizationRef?
+
+    private func acquireAuthorization() -> AuthorizationRef? {
+        if let existing = cachedAuth { return existing }
+
+        var auth: AuthorizationRef?
+        guard AuthorizationCreate(nil, nil, [], &auth) == errAuthorizationSuccess,
+              let auth else { return nil }
+
+        // Shows native macOS Touch ID or password dialog for admin rights
+        let granted = kAuthorizationRightExecute.withCString { namePtr in
+            var item = AuthorizationItem(name: namePtr, valueLength: 0, value: nil, flags: 0)
+            return withUnsafeMutablePointer(to: &item) { itemPtr in
+                var rights = AuthorizationRights(count: 1, items: itemPtr)
+                return AuthorizationCopyRights(
+                    auth, &rights, nil,
+                    [.interactionAllowed, .extendRights, .preAuthorize],
+                    nil
+                ) == errAuthorizationSuccess
+            }
+        }
+
+        if granted {
+            cachedAuth = auth
+            return auth
+        }
+        AuthorizationFree(auth, .destroyRights)
+        return nil
+    }
+
+    private func executePrivileged(tool: String, arguments: [String], completion: (() -> Void)? = nil) {
+        guard let auth = acquireAuthorization() else { return }
+
+        // AuthorizationExecuteWithPrivileges is deprecated and unavailable in Swift.
+        // Call it via dlsym to bypass the availability check — the symbol is still present at runtime.
+        typealias AuthExecFn = @convention(c) (
+            AuthorizationRef,
+            UnsafePointer<CChar>,
+            UInt32,
+            UnsafePointer<UnsafeMutablePointer<CChar>?>,
+            UnsafeMutablePointer<UnsafeMutablePointer<FILE>?>?
+        ) -> Int32
+
+        guard let sym = dlsym(dlopen(nil, RTLD_LAZY), "AuthorizationExecuteWithPrivileges") else { return }
+        let execFn = unsafeBitCast(sym, to: AuthExecFn.self)
+
+        let cArgs = arguments.map { strdup($0)! }
+        defer { cArgs.forEach { free($0) } }
+
+        var argv: [UnsafeMutablePointer<CChar>?] = cArgs.map { Optional($0) }
+        argv.append(nil)
+
+        let status: Int32 = argv.withUnsafeBufferPointer { buf in
+            execFn(auth, tool, 0, buf.baseAddress!, nil)
+        }
+
+        if status != 0 {
+            if let a = cachedAuth { AuthorizationFree(a, .destroyRights) }
+            cachedAuth = nil
+        }
+
+        completion?()
     }
 }
 
